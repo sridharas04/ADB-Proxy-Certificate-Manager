@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # ==============================================================================
 # Script Name: ADB Proxy & Certificate Manager
@@ -6,13 +6,28 @@
 # Date:        2025-11-18
 # Purpose:     Manage HTTP Proxies and Inject System Certificates (Android 10-14+)
 # Dependencies: adb, openssl, curl
-# Compatibility: Bash, Zsh, POSIX sh
+# Compatibility: Bash (Required for History/Navigation)
 # ==============================================================================
 
-PROXY_HOST="10.0.2.2"
-PROXY_PORT="8080"
+# --- Persistence Files ---
+CONFIG_FILE="$HOME/.adb_proxy.conf"
+HISTORY_FILE="$HOME/.adb_proxy_history"
+
+# --- Load Saved Config ---
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+else
+    PROXY_HOST="10.0.2.2"
+    PROXY_PORT="8080"
+fi
+
 CERT_URL="http://127.0.0.1:8080/cert"
 DEVICE_SERIAL=""
+
+# --- Setup History ---
+touch "$HISTORY_FILE"
+shopt -s histappend
+history -r "$HISTORY_FILE"
 
 setup_colors() {
     if command -v tput >/dev/null 2>&1 && [ -n "$TERM" ]; then
@@ -32,6 +47,11 @@ setup_colors() {
     fi
 }
 
+save_config() {
+    echo "PROXY_HOST=\"$PROXY_HOST\"" > "$CONFIG_FILE"
+    echo "PROXY_PORT=\"$PROXY_PORT\"" >> "$CONFIG_FILE"
+}
+
 check_dependencies() {
     for cmd in adb openssl curl; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -43,7 +63,8 @@ check_dependencies() {
 }
 
 cleanup_local() {
-    rm -f "cert_raw" "cert.pem" "device_installer.sh"
+    history -w "$HISTORY_FILE"
+    rm -f "cert_raw" "cert.pem" "device_installer.sh" "magisk_boot_script.sh"
 }
 trap cleanup_local EXIT INT TERM
 
@@ -60,17 +81,32 @@ ensure_online() {
     
     local state
     state=$(adb -s "$DEVICE_SERIAL" get-state 2>/dev/null)
+    
+    # If device is offline/missing, offer to switch
     if [ "$state" != "device" ]; then
-        print_info "Device offline. Waiting for connection..."
-        adb -s "$DEVICE_SERIAL" wait-for-device
-        print_success "Device reconnected."
+        print_warn "Device '$DEVICE_SERIAL' is offline or disconnected."
+        read -e -p "$(printf "${YELLOW}Do you want to switch devices? (y/n): ${NC}")" REPLY
+        if [[ "$REPLY" == [yY]* ]]; then
+            select_device
+            # Re-check state after switching
+            state=$(adb -s "$DEVICE_SERIAL" get-state 2>/dev/null)
+            if [ "$state" != "device" ]; then
+                print_error "New device is also offline."
+                return 1
+            fi
+        else
+            print_info "Waiting for reconnection..."
+            adb -s "$DEVICE_SERIAL" wait-for-device
+            print_success "Device reconnected."
+        fi
     fi
     
+    # Wait for system services to be ready (prevents broken pipe errors)
     local retries=0
-    while ! adb -s "$DEVICE_SERIAL" shell "service check settings" >/dev/null 2>&1; do
+    until adb -s "$DEVICE_SERIAL" shell "pm path android" >/dev/null 2>&1; do
         retries=$((retries+1))
         if [ "$retries" -gt 8 ]; then return 0; fi
-        sleep 2
+        sleep 1
     done
     return 0
 }
@@ -118,8 +154,7 @@ check_proxy_connection() {
         return 0
     else
         print_error "Could NOT connect to $CHECK_HOST:$PROXY_PORT."
-        printf "%sSet proxy anyway? (y/n): %s" "$YELLOW" "$NC"
-        read -r REPLY
+        read -e -p "$(printf "${YELLOW}Set proxy anyway? (y/n): ${NC}")" REPLY
         case "$REPLY" in
             [yY]*) return 0 ;;
             *) return 1 ;;
@@ -130,22 +165,21 @@ check_proxy_connection() {
 configure_proxy() {
     printf "%sCurrent Configuration: %s%s:%s%s\n" "$YELLOW" "$CYAN" "$PROXY_HOST" "$PROXY_PORT" "$NC"
     
-    printf "Enter Host [default: %s]: " "$PROXY_HOST"
-    read -r NEW_HOST
+    read -e -p "Enter Host [default: $PROXY_HOST]: " NEW_HOST
     if [ -n "$NEW_HOST" ]; then PROXY_HOST="$NEW_HOST"; fi
     
-    printf "Enter Port [default: %s]: " "$PROXY_PORT"
-    read -r NEW_PORT
+    read -e -p "Enter Port [default: $PROXY_PORT]: " NEW_PORT
     if [ -n "$NEW_PORT" ]; then PROXY_PORT="$NEW_PORT"; fi
     
-    print_info "Configuration updated."
+    save_config
+    print_info "Configuration saved."
     start_proxy
 }
 
 start_proxy() {
     if check_proxy_connection; then
         ensure_online || return
-        adb -s "$DEVICE_SERIAL" shell settings put global http_proxy "$PROXY_HOST:$PROXY_PORT" 2>/dev/null
+        adb -s "$DEVICE_SERIAL" shell settings put global http_proxy "$PROXY_HOST:$PROXY_PORT" >/dev/null 2>&1
         print_success "Proxy set to ${CYAN}$PROXY_HOST:$PROXY_PORT${NC}"
         get_proxy
     else
@@ -155,9 +189,9 @@ start_proxy() {
 
 stop_proxy() {
     ensure_online || return
-    adb -s "$DEVICE_SERIAL" shell settings put global http_proxy :0 2>/dev/null
-    adb -s "$DEVICE_SERIAL" shell settings delete global global_http_proxy_host 2>/dev/null
-    adb -s "$DEVICE_SERIAL" shell settings delete global global_http_proxy_port 2>/dev/null
+    adb -s "$DEVICE_SERIAL" shell settings put global http_proxy :0 >/dev/null 2>&1
+    adb -s "$DEVICE_SERIAL" shell settings delete global global_http_proxy_host >/dev/null 2>&1
+    adb -s "$DEVICE_SERIAL" shell settings delete global global_http_proxy_port >/dev/null 2>&1
     print_success "Proxy stopped."
     get_proxy
 }
@@ -166,6 +200,11 @@ get_proxy() {
     ensure_online || return
     current_proxy=$(adb -s "$DEVICE_SERIAL" shell settings get global http_proxy 2>/dev/null | tr -d '\r')
     
+    if [[ "$current_proxy" == *"Failure calling"* ]] || [[ "$current_proxy" == *"Broken pipe"* ]]; then
+        printf "Current Status: %sDevice Initializing... (Try again in 5s)%s\n" "$YELLOW" "$NC"
+        return
+    fi
+
     if [ "$current_proxy" = "null" ] || [ "$current_proxy" = ":0" ] || [ -z "$current_proxy" ]; then
         printf "Current Status: %sNo Proxy%s\n" "$GREEN" "$NC"
     else
@@ -180,7 +219,6 @@ prepare_cert() {
     curl -s -o "$RAW_CERT" "$CERT_URL"
     
     if [ ! -s "$RAW_CERT" ]; then
-        print_error "Failed to download certificate."
         return 1
     fi
     
@@ -188,31 +226,61 @@ prepare_cert() {
         cp "$RAW_CERT" "$PEM_CERT"
     else
         openssl x509 -inform DER -in "$RAW_CERT" -out "$PEM_CERT" 2>/dev/null
-        if [ ! -s "$PEM_CERT" ]; then print_error "Conversion failed."; return 1; fi
+        if [ ! -s "$PEM_CERT" ]; then return 1; fi
     fi
     
     CERT_HASH=$(openssl x509 -inform PEM -subject_hash_old -in "$PEM_CERT" | head -1)
-    if [ -z "$CERT_HASH" ]; then print_error "Failed to calculate hash."; return 1; fi
+    if [ -z "$CERT_HASH" ]; then return 1; fi
     print_info "Hash: ${CYAN}$CERT_HASH${NC}"
     return 0
 }
 
 install_system_certificate() {
     ensure_online || return
-    prepare_cert || return
-
+    
+    local CERT_FILENAME="unknown.0"
+    local HAS_PROXY_CERT=0
+    local HAS_USER_CERTS=0
     local DEVICE_TMP_PATH="/data/local/tmp"
-    local CERT_FILENAME="$CERT_HASH.0"
+
+    # 1. Try getting Proxy Cert with RETRY LOGIC
+    while true; do
+        if prepare_cert; then
+            HAS_PROXY_CERT=1
+            CERT_FILENAME="$CERT_HASH.0"
+            print_info "Pushing certificate..."
+            adb -s "$DEVICE_SERIAL" push "cert.pem" "$DEVICE_TMP_PATH/$CERT_FILENAME" > /dev/null
+            break
+        else
+            print_warn "Failed to download proxy certificate."
+            read -e -p "$(printf "${YELLOW}Retry download from Proxy? (y/n) [n to check User Certs]: ${NC}")" REPLY
+            if [[ "$REPLY" != [yY]* ]]; then
+                print_info "Skipping download. Checking for existing User Certificates on device..."
+                break 
+            fi
+        fi
+    done
+
+    # 2. Check for User Certs on device (USING SU TO FIX PERMISSIONS)
+    if adb -s "$DEVICE_SERIAL" shell "su -c 'ls /data/misc/user/0/cacerts-added/* 2>/dev/null'" >/dev/null 2>&1; then
+        HAS_USER_CERTS=1
+        print_info "Found existing User Certificates."
+    fi
+
+    # 3. Validate
+    if [ "$HAS_PROXY_CERT" -eq 0 ] && [ "$HAS_USER_CERTS" -eq 0 ]; then
+        print_error "No certificates found!"
+        print_info "  - Start your Proxy tool to download a cert."
+        print_info "  - OR manually install a User Certificate first."
+        return 1
+    fi
     
-    print_info "Pushing certificate..."
-    adb -s "$DEVICE_SERIAL" push "cert.pem" "$DEVICE_TMP_PATH/$CERT_FILENAME" > /dev/null
-    
-    # Generate Installer Script (Run on device)
     cat <<EOF > device_installer.sh
 #!/system/bin/sh
 CERT_FILE="$DEVICE_TMP_PATH/$CERT_FILENAME"
-RAM_DISK="/data/local/tmp/cert_overlay_$CERT_HASH"
+RAM_DISK="/data/local/tmp/cert_overlay_live"
 LEGACY_PATH="/system/etc/security/cacerts"
+USER_CERTS_PATH="/data/misc/user/0/cacerts-added"
 
 SDK=\$(getprop ro.build.version.sdk)
 if [ "\$SDK" -ge 34 ]; then
@@ -235,9 +303,28 @@ setenforce 0
 mkdir -p "\$RAM_DISK"
 mount -t tmpfs tmpfs "\$RAM_DISK"
 
+echo "Copying System certificates..."
 cp "\$TARGET_PATH"/* "\$RAM_DISK/"
-cp "\$CERT_FILE" "\$RAM_DISK/"
 
+EOF
+
+    if [ "$HAS_PROXY_CERT" -eq 1 ]; then
+        echo "cp \"\$CERT_FILE\" \"\$RAM_DISK/\"" >> device_installer.sh
+    fi
+
+    if [ "$HAS_USER_CERTS" -eq 1 ]; then
+        cat <<EOLOOP >> device_installer.sh
+if [ -d "\$USER_CERTS_PATH" ]; then
+    for U_CERT in "\$USER_CERTS_PATH"/*.0; do
+        if [ -f "\$U_CERT" ]; then
+            cp "\$U_CERT" "\$RAM_DISK/"
+        fi
+    done
+fi
+EOLOOP
+    fi
+
+    cat <<EOF >> device_installer.sh
 chown 0:0 "\$RAM_DISK"/*
 chmod 644 "\$RAM_DISK"/*
 chcon u:object_r:system_file:s0 "\$RAM_DISK"/*
@@ -246,13 +333,6 @@ mount --bind "\$RAM_DISK" "\$TARGET_PATH"
 
 if [ "\$DO_DUAL_MOUNT" -eq 1 ]; then
     mount --bind "\$RAM_DISK" "\$LEGACY_PATH"
-fi
-
-if ls "\$TARGET_PATH/$CERT_FILENAME" >/dev/null 2>&1; then
-    echo "SUCCESS_TEMPORARY"
-else
-    echo "FAILURE"
-    exit 1
 fi
 
 inject_mount() {
@@ -301,7 +381,6 @@ EOF
     local OUTPUT
     OUTPUT=$(adb -s "$DEVICE_SERIAL" shell "su -c \"$CMD\"")
     
-    # Verbose output for user clarity
     case "$OUTPUT" in
         *"SUCCESS_INJECTED"*)
             print_success "Certificate injected via RAM Overlay!"
@@ -314,14 +393,15 @@ EOF
             print_success "Injection applied to:"
             print_info "  - System Path (Apps)"
             print_info "  - Legacy Path (Chrome Compatibility)"
+            print_info "  - User Store Certs moved to System"
             print_info "  - Zygote (New Apps)"
             print_info "  - Running Apps (Immediate)"
             
             cleanup_local
-            adb -s "$DEVICE_SERIAL" shell "rm $DEVICE_TMP_PATH/$CERT_FILENAME $DEVICE_TMP_PATH/installer.sh"
+            adb -s "$DEVICE_SERIAL" shell "rm $DEVICE_TMP_PATH/$CERT_FILENAME $DEVICE_TMP_PATH/installer.sh" 2>/dev/null
             ;;
         *)
-            print_error "Injection failed. Device output:"
+            print_error "Injection failed. Output:"
             echo "$OUTPUT"
             ;;
     esac
@@ -329,48 +409,195 @@ EOF
 
 install_user_certificate() {
     ensure_online || return
-    prepare_cert || return
+    
+    # FIX: Retry logic if proxy is not running
+    while true; do
+        if prepare_cert; then
+            break
+        else
+            print_warn "Could not download proxy certificate."
+            read -e -p "$(printf "${YELLOW}Is your Proxy (Burp/HTTP Toolkit) running? Try again? (y/n): ${NC}")" REPLY
+            if [[ "$REPLY" != [yY]* ]]; then
+                return
+            fi
+        fi
+    done
     
     print_info "Pushing certificate to Downloads..."
     adb -s "$DEVICE_SERIAL" push "cert.pem" "/sdcard/Download/burp_cert.crt" > /dev/null
     
-    print_warn "--- MANUAL INTERACTION REQUIRED ---"
-    print_info "I have pushed 'burp_cert.crt' to /sdcard/Download/"
-    print_info "Please perform the following steps on your device:"
-    print_info "1. In Settings. Look For CA Certificate"
-    print_info "2. Tap 'Install a certificate' -> 'CA certificate'."
-    print_info "3. Tap 'Install Anyway' if prompted."
-    print_info "4. Select 'burp_cert.crt' from Downloads."
+    print_warn "Manual Steps:"
+    print_warn "1. Tap 'Install a certificate' -> 'CA certificate'"
+    print_warn "2. Select 'burp_cert.crt' from Downloads"
     
-    echo ""
-    print_info "Opening Encryption & Credentials Settings..."
+    print_info "Opening Security Settings..."
     
-    # Try primary method (Android 11+)
     adb -s "$DEVICE_SERIAL" shell "am start -a android.settings.ENCRYPTION_AND_CREDENTIALS_SETTINGS" >/dev/null 2>&1
-    
-    # Fallback for older devices or different skins
     adb -s "$DEVICE_SERIAL" shell "am start -a android.settings.SECURITY_SETTINGS" >/dev/null 2>&1
     
-    # Fallback to generic settings if all else fails
-    adb -s "$DEVICE_SERIAL" shell "am start -a android.settings.SETTINGS" >/dev/null 2>&1
+    print_success "Complete installation on device."
     
-    print_success "Check your device screen now."
+    cleanup_local
+}
+
+create_magisk_module() {
+    ensure_online || return
+    
+    local CERT_FILENAME="unknown.0"
+    local HAS_PROXY_CERT=0
+    local HAS_USER_CERTS=0
+    local MOD_ID="adb_proxy_cert"
+    local MOD_PATH="/data/adb/modules/$MOD_ID"
+
+    print_info "Checking for Magisk/Root..."
+    if ! adb -s "$DEVICE_SERIAL" shell "su -c 'ls /data/adb/modules'" > /dev/null 2>&1; then
+        print_error "Magisk not found."
+        print_warn "Option 6 requires a rooted device with Magisk."
+        return 1
+    fi
+
+    # RETRY LOGIC for Proxy Cert
+    while true; do
+        if prepare_cert; then
+            HAS_PROXY_CERT=1
+            CERT_FILENAME="$CERT_HASH.0"
+            break
+        else
+            print_warn "Could not download proxy certificate. Checking User Certs..."
+            read -e -p "$(printf "${YELLOW}Try downloading from Proxy again? (y/n) [n to check User Certs]: ${NC}")" REPLY
+            if [[ "$REPLY" != [yY]* ]]; then
+                break
+            fi
+        fi
+    done
+
+    if adb -s "$DEVICE_SERIAL" shell "su -c 'ls /data/misc/user/0/cacerts-added/* 2>/dev/null'" >/dev/null 2>&1; then
+        HAS_USER_CERTS=1
+        print_info "Found existing User Certificates."
+    fi
+
+    if [ "$HAS_PROXY_CERT" -eq 0 ] && [ "$HAS_USER_CERTS" -eq 0 ]; then
+        print_error "No certificates found (Download failed & No User Certs)."
+        print_info "Cannot create module without at least one certificate source."
+        return 1
+    fi
+    
+    print_info "Creating Magisk Module on device..."
+    
+    adb -s "$DEVICE_SERIAL" shell "su -c 'rm -rf $MOD_PATH'"
+    adb -s "$DEVICE_SERIAL" shell "su -c 'mkdir -p $MOD_PATH/system/etc/security/cacerts'"
+    
+    if [ "$HAS_PROXY_CERT" -eq 1 ]; then
+        print_info "Pushing proxy certificate..."
+        adb -s "$DEVICE_SERIAL" push "cert.pem" "/data/local/tmp/$CERT_FILENAME" > /dev/null
+        adb -s "$DEVICE_SERIAL" shell "su -c 'cp /data/local/tmp/$CERT_FILENAME $MOD_PATH/system/etc/security/cacerts/$CERT_FILENAME'"
+        adb -s "$DEVICE_SERIAL" shell "su -c 'rm /data/local/tmp/$CERT_FILENAME'"
+    fi
+    
+    print_info "Creating module.prop..."
+    adb -s "$DEVICE_SERIAL" shell "su -c 'echo \"id=$MOD_ID\" > $MOD_PATH/module.prop'"
+    adb -s "$DEVICE_SERIAL" shell "su -c 'echo \"name=ADB Proxy CA\" >> $MOD_PATH/module.prop'"
+    adb -s "$DEVICE_SERIAL" shell "su -c 'echo \"version=1.0\" >> $MOD_PATH/module.prop'"
+    adb -s "$DEVICE_SERIAL" shell "su -c 'echo \"versionCode=1\" >> $MOD_PATH/module.prop'"
+    adb -s "$DEVICE_SERIAL" shell "su -c 'echo \"author=Darkprince\" >> $MOD_PATH/module.prop'"
+    adb -s "$DEVICE_SERIAL" shell "su -c 'echo \"description=Injects Proxy CA & User Certs into System Store (Android 14+)\" >> $MOD_PATH/module.prop'"
+
+    cat <<EOF > magisk_boot_script.sh
+#!/system/bin/sh
+MODDIR=\${0%/*}
+CERT_FILE="\$MODDIR/system/etc/security/cacerts/$CERT_FILENAME"
+RAM_DISK="/data/local/tmp/cert_overlay_magisk"
+LEGACY_PATH="/system/etc/security/cacerts"
+USER_CERTS_PATH="/data/misc/user/0/cacerts-added"
+
+SDK=\$(getprop ro.build.version.sdk)
+if [ "\$SDK" -ge 34 ]; then
+    # --- ANDROID 14+ LOGIC (APEX OVERLAY) ---
+    RAW_PATH="/apex/com.android.conscrypt/cacerts"
+    if [ -f /system/bin/realpath ]; then
+        TARGET_PATH=\$(realpath "\$RAW_PATH")
+    else
+        TARGET_PATH="\$RAW_PATH"
+    fi
+    DO_DUAL_MOUNT=1
+    
+    # Safety Timeout: wait up to 15s for path
+    TIMEOUT=15
+    while [ ! -d "\$TARGET_PATH" ]; do
+        sleep 1
+        TIMEOUT=\$((TIMEOUT-1))
+        if [ "\$TIMEOUT" -le 0 ]; then exit 0; fi
+    done
+
+    mkdir -p "\$RAM_DISK"
+    mount -t tmpfs tmpfs "\$RAM_DISK"
+
+    cp "\$TARGET_PATH"/* "\$RAM_DISK/"
+    if [ -f "\$CERT_FILE" ]; then cp "\$CERT_FILE" "\$RAM_DISK/"; fi
+    if [ -d "\$USER_CERTS_PATH" ]; then
+        for U_CERT in "\$USER_CERTS_PATH"/*.0; do
+            if [ -f "\$U_CERT" ]; then cp "\$U_CERT" "\$RAM_DISK/"; fi
+        done
+    fi
+
+    chown 0:0 "\$RAM_DISK"/*
+    chmod 644 "\$RAM_DISK"/*
+    chcon u:object_r:system_file:s0 "\$RAM_DISK"/*
+    chcon u:object_r:system_file:s0 "\$RAM_DISK"
+
+    mount --bind "\$RAM_DISK" "\$TARGET_PATH"
+    mount --bind "\$RAM_DISK" "\$LEGACY_PATH"
+
+else
+    # --- LEGACY LOGIC (ANDROID 13 & BELOW) ---
+    # Native Magisk Magic Mount (Copy to module dir)
+    DEST_DIR="\$MODDIR/system/etc/security/cacerts"
+    if [ -d "\$USER_CERTS_PATH" ]; then
+        for U_CERT in "\$USER_CERTS_PATH"/*.0; do
+            if [ -f "\$U_CERT" ]; then cp -f "\$U_CERT" "\$DEST_DIR/"; fi
+        done
+    fi
+    chown -R 0:0 "\$DEST_DIR"
+    chmod -R 644 "\$DEST_DIR"
+    chcon -R u:object_r:system_file:s0 "\$DEST_DIR"
+fi
+EOF
+
+    adb -s "$DEVICE_SERIAL" push magisk_boot_script.sh "/data/local/tmp/post-fs-data.sh" > /dev/null
+    adb -s "$DEVICE_SERIAL" shell "su -c 'mv /data/local/tmp/post-fs-data.sh $MOD_PATH/post-fs-data.sh'"
+    
+    adb -s "$DEVICE_SERIAL" shell "su -c 'chmod 755 $MOD_PATH/post-fs-data.sh'"
+    adb -s "$DEVICE_SERIAL" shell "su -c 'chown 0:0 $MOD_PATH/post-fs-data.sh'"
+    adb -s "$DEVICE_SERIAL" shell "su -c 'chmod 644 $MOD_PATH/module.prop'"
+    
+    adb -s "$DEVICE_SERIAL" shell "su -c 'touch $MOD_PATH/auto_mount'"
+
+    print_success "Magisk Module Installed!"
+    cleanup_local
+    
+    printf "%sReboot now to apply? (y/n): %s" "$YELLOW" "$NC"
+    read -r REPLY
+    case "$REPLY" in
+        [yY]*) adb -s "$DEVICE_SERIAL" reboot ;;
+        *) print_info "Please reboot manually." ;;
+    esac
 }
 
 show_menu() {
     echo ""
     printf "%s--- Actions ---%s\n" "$CYAN" "$NC"
     echo "1) Start Proxy"
-    echo "2) Change Proxy Config"
-    echo "3) Stop Proxy"
+    echo "2) Stop Proxy"
+    echo "3) Change Proxy Config"
     echo "4) Get Proxy Status"
-    echo "5) Install System Certificate (Live Injection)"
-    echo "6) Install User Certificate (Chrome Fix Android 14+)"
+    echo "5) Install System Cert (Temp until reboot)"
+    echo "6) Install System Cert (Permanent Magisk)"
+    echo "7) Install User Cert (Chrome Fix)"
+    echo "8) Switch Device"
     echo "m) Show menu"
     echo "q) Quit"
 }
 
-# --- Main Execution ---
 setup_colors
 check_dependencies
 printf "%s=== ADB Proxy & Cert Manager ===%s\n" "$CYAN" "$NC"
@@ -379,14 +606,21 @@ show_menu
 
 while true; do
     printf "\n%s?# %s" "$YELLOW" "$NC"
-    read -r choice
+    read -e -p "" choice
+    
+    if [ -n "$choice" ]; then
+        history -s "$choice"
+    fi
+    
     case "$choice" in
         1) start_proxy ;;
-        2) configure_proxy ;;
-        3) stop_proxy ;;
+        2) stop_proxy ;;
+        3) configure_proxy ;;
         4|get) get_proxy ;;
         5) install_system_certificate ;;
-        6) install_user_certificate ;;
+        6) create_magisk_module ;;
+        7) install_user_certificate ;;
+        8|s) select_device ;;
         m|menu) show_menu ;;
         q|quit) print_info "Exiting..."; exit 0 ;;
         *) print_error "Invalid option." ;;
