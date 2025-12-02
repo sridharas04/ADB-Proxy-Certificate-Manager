@@ -6,19 +6,19 @@ This tool is designed for penetration testers and developers using proxy tools s
 
 ---
 
-## 🚀 Features
+##  Features
 
-* **🔌 One-Click Proxy:** Toggle HTTP Proxy settings on your device instantly.
-* **🛡️ Android 14+ Support:** Bypasses new read-only APEX certificate stores using `nsenter` namespace injection.
-* **💉 Live Injection:** Installs System Certificates without rebooting the device (Temporary).
-* **♾️ Permanent Mode:** Auto-generates and installs a custom Magisk module to persist certificates across reboots.
-* **🔧 Chrome Fix:** Includes a built-in helper to install User Certificates for browsers that distrust System stores.
-* **📱 Multi-Device:** Easily switch between multiple connected emulators or physical devices.
-* **🧠 Universal:** Auto-detects the host OS version (Android 10-14+) and applies the correct mounting strategy.
+* **One-Click Proxy:** Toggle HTTP Proxy settings on your device instantly.
+* **Android 14+ Support:** Bypasses new read-only APEX certificate stores using `nsenter` namespace injection.
+* **Live Injection:** Installs System Certificates without rebooting the device (Temporary).
+* **Permanent Mode:** Auto-generates and installs a custom Magisk module to persist certificates across reboots.
+* **Chrome Fix:** Includes a built-in helper to install User Certificates for browsers that distrust System stores.
+* **Multi-Device:** Easily switch between multiple connected emulators or physical devices.
+* **Universal:** Auto-detects the host OS version (Android 10-14+) and applies the correct mounting strategy.
 
 ---
 
-## 🛠 Prerequisites
+##  Prerequisites
 
 Ensure you have the following installed on your host machine:
 
@@ -29,7 +29,7 @@ Ensure you have the following installed on your host machine:
 
 ---
 
-## ⬇️ Installation
+##  Installation
 
 Use your system's package manager to install the required tools:
 
@@ -43,7 +43,7 @@ brew install android-platform-tools openssl curl
 sudo apt install adb openssl curl
 ```
 
-## ⚙️ Configuration
+##  Configuration
 
 By default, the script is configured for **Burp Suite** or **HTTP Toolkit** running on localhost. You can extend this to work with other proxies by editing the variables at the top of `adb_proxy.sh`:
 
@@ -92,7 +92,7 @@ By default, the script is configured for **Burp Suite** or **HTTP Toolkit** runn
 
 ---
 
-## 🧠 How It Works
+##  How It Works
 
 Installing system certificates became significantly harder in recent Android versions. This script uses two different strategies to bypass restrictions.
 
@@ -110,10 +110,3 @@ Installing system certificates became significantly harder in recent Android ver
 * **Boot Script:** Writes a `post-fs-data.sh` script that runs on every boot.
 * **Auto-Sync:** This script detects Android version (Legacy vs. 14+) and mounts the certificate automatically before apps start. It also copies any User Certificates you install manually into the System store.
 
----
-
-## ⚠️ Limitations
-
-* **Temporary Injection (Option 5):** Uses a RAM overlay, so the injection is lost upon reboot.
-* **Permanent Injection (Option 6):** Persists across reboots but requires Magisk.
-* **Chrome/WebView:** Chrome has aggressive Certificate Pinning. If Chrome rejects the System cert (showing `ERR_CERT_AUTHORITY_INVALID`), use **Option 7** to install it as a User Certificate as well.
